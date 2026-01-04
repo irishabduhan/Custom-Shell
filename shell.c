@@ -6,116 +6,181 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 
-int main() {
-    pid_t pid;
+#define MAX_CMD 100
+#define MAX_ARGS 20
 
-    while (true) {
-        printf("shell>> ");
-        fflush(stdout);
+/* ---------- Utility ---------- */
 
-        char cmd[100];
-        fgets(cmd, sizeof(cmd), stdin);
+void print_prompt() {
+    printf("shell>> ");
+    fflush(stdout);
+}
 
-        // remove newline
-        cmd[strcspn(cmd, "\n")] = '\0';
+bool read_command(char *cmd) {
+    if (!fgets(cmd, MAX_CMD, stdin))
+        return false;
+    cmd[strcspn(cmd, "\n")] = '\0';
+    return true;
+}
 
-        // remove trailing spaces
-        int len = strlen(cmd);
-        while (len > 0 && (cmd[len - 1] == ' ' || cmd[len - 1] == '\t')) {
-            cmd[--len] = '\0';
-        }
+void trim_trailing_spaces(char *cmd) {
+    int len = strlen(cmd);
+    while (len > 0 && (cmd[len - 1] == ' ' || cmd[len - 1] == '\t')) {
+        cmd[--len] = '\0';
+    }
+}
 
-        if (len == 0)
-            continue;
+bool check_background(char *cmd) {
+    int len = strlen(cmd);
+    if (len > 0 && cmd[len - 1] == '&') {
+        cmd[--len] = '\0';
+        trim_trailing_spaces(cmd);
+        return true;
+    }
+    return false;
+}
 
-        // check background execution
-        bool background = false;
-        if (cmd[len - 1] == '&') {
-            background = true;
-            cmd[--len] = '\0';
+void tokenize(char *cmd, char **args) {
+    int i = 0;
+    char *token = strtok(cmd, " ");
+    while (token && i < MAX_ARGS - 1) {
+        args[i++] = token;
+        token = strtok(NULL, " ");
+    }
+    args[i] = NULL;
+}
 
-            // remove spaces before &
-            while (len > 0 && cmd[len - 1] == ' ') {
-                cmd[--len] = '\0';
-            }
-        }
+/* ---------- Built-ins ---------- */
 
-        // exit command (parent handled)
-        if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "Exit") == 0) {
-            break;
-        }
+bool handle_builtin(char **args) {
+    if (strcmp(args[0], "pwd") == 0) {
+        char cwd[1024];
+        getcwd(cwd, sizeof(cwd));
+        printf("%s\n", cwd);
+        return true;
+    }
 
-        // tokenize command
-        char *args[20];
-        int i = 0;
-        char *token = strtok(cmd, " ");
-        while (token != NULL) {
-            args[i++] = token;
-            token = strtok(NULL, " ");
-        }
-        args[i] = NULL;
+    if (strcmp(args[0], "cd") == 0) {
+        if (!args[1])
+            fprintf(stderr, "cd: missing operand\n");
+        else if (chdir(args[1]) != 0)
+            perror("cd");
+        return true;
+    }
 
-        pid = fork();
+    if (strcmp(args[0], "mkdir") == 0) {
+        if (!args[1])
+            fprintf(stderr, "mkdir: missing operand\n");
+        else if (mkdir(args[1], 0755) != 0)
+            perror("mkdir");
+        return true;
+    }
 
-        if (pid < 0) {
-            perror("fork failed");
-        }
-        else if (pid == 0) {
-            /* ================= CHILD PROCESS ================= */
+    if (strcmp(args[0], "help") == 0) {
+        printf("Supported commands:\n");
+        printf("pwd\ncd <dir>\nmkdir <dir>\nls <flags>\nexit\nhelp\n");
+        return true;
+    }
 
-            // pwd
-            if (strcmp(args[0], "pwd") == 0) {
-                char cwd[1024];
-                if (getcwd(cwd, sizeof(cwd)) != NULL)
-                    printf("%s\n", cwd);
-                else
-                    perror("pwd");
-                exit(0);
-            }
+    return false;
+}
 
-            // cd (must be here for assignment compliance)
-            if (strcmp(args[0], "cd") == 0) {
-                if (args[1] == NULL)
-                    fprintf(stderr, "cd: missing operand\n");
-                else if (chdir(args[1]) != 0)
-                    perror("cd");
-                exit(0);
-            }
+/* ---------- Execute without pipe ---------- */
 
-            // mkdir
-            if (strcmp(args[0], "mkdir") == 0) {
-                if (args[1] == NULL)
-                    fprintf(stderr, "mkdir: missing operand\n");
-                else if (mkdir(args[1], 0755) != 0)
-                    perror("mkdir");
-                exit(0);
-            }
+void execute_simple(char **args, bool background) {
+    pid_t pid = fork();
 
-            // help
-            if (strcmp(args[0], "help") == 0) {
-                printf("Supported commands:\n");
-                printf("pwd\n");
-                printf("cd <directory>\n");
-                printf("mkdir <directory>\n");
-                printf("ls <flags>\n");
-                printf("exit\n");
-                printf("help\n");
-                printf("Executable commands are also supported\n");
-                exit(0);
-            }
-
-            // ls and any other executable
+    if (pid == 0) {
+        if (!handle_builtin(args)) {
             execvp(args[0], args);
             perror("command not found");
-            exit(1);
+        }
+        exit(0);
+    }
+
+    if (!background)
+        waitpid(pid, NULL, 0);
+}
+
+/* ---------- Execute with single pipe ---------- */
+
+void execute_pipe(char *left, char *right, bool background) {
+    int fd[2];
+    pipe(fd);
+
+    char *args1[MAX_ARGS];
+    char *args2[MAX_ARGS];
+
+    tokenize(left, args1);
+    tokenize(right, args2);
+
+    pid_t pid1 = fork();
+    if (pid1 == 0) {
+        dup2(fd[1], STDOUT_FILENO);
+        close(fd[0]);
+        close(fd[1]);
+        execvp(args1[0], args1);
+        perror("left command failed");
+        exit(1);
+    }
+
+    pid_t pid2 = fork();
+    if (pid2 == 0) {
+        dup2(fd[0], STDIN_FILENO);
+        close(fd[1]);
+        close(fd[0]);
+        execvp(args2[0], args2);
+        perror("right command failed");
+        exit(1);
+    }
+
+    close(fd[0]);
+    close(fd[1]);
+
+    if (!background) {
+        waitpid(pid1, NULL, 0);
+        waitpid(pid2, NULL, 0);
+    }
+}
+
+/* ---------- Main ---------- */
+
+int main() {
+    char cmd[MAX_CMD];
+
+    while (true) {
+        print_prompt();
+
+        if (!read_command(cmd))
+            break;
+
+        trim_trailing_spaces(cmd);
+        if (strlen(cmd) == 0)
+            continue;
+
+        if (!strcmp(cmd, "exit") || !strcmp(cmd, "Exit"))
+            break;
+
+        bool background = check_background(cmd);
+
+        char *pipe_pos = strchr(cmd, '|');
+
+        if (pipe_pos) {
+            *pipe_pos = '\0';
+            char *left = cmd;
+            char *right = pipe_pos + 1;
+
+            trim_trailing_spaces(left);
+            trim_trailing_spaces(right);
+
+            execute_pipe(left, right, background);
         }
         else {
-            /* ================= PARENT PROCESS ================= */
-            if (!background) {
-                waitpid(pid, NULL, 0);
-            }
+            char *args[MAX_ARGS];
+            tokenize(cmd, args);
+            execute_simple(args, background);
         }
     }
-    
+
     return 0;
 }
